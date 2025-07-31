@@ -1,15 +1,22 @@
 import os
-from typing import Annotated, Dict, List, Optional, TypedDict, Union, Any
-from dataclasses import dataclass, asdict
+from typing import Annotated, Dict, List, Optional, TypedDict, Union, Any, Literal
+from dataclasses import dataclass, field
 from enum import Enum
 import json
 import re
 import uuid
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
+from contextlib import contextmanager
 
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    ToolMessage,
+    BaseMessage,
+    SystemMessage,
+)
 from langchain_core.tools import BaseTool, tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
@@ -19,103 +26,1090 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from pydantic import BaseModel, Field
 
-# Configure logging for production debugging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv(dotenv_path=".env.agents", override=True)
 
 
-class AgentDecision(Enum):
-    """Enumeration of possible agent decision states."""
+class InterruptDecision(str, Enum):
+    """Interrupt decision states with string inheritance for seamless serialization."""
 
-    CONTINUE = "continue"
-    FINISH = "finish"
-    ERROR = "error"
-
-
-@dataclass
-class ReasoningStep:
-    """Encapsulates a single reasoning step with thought, action, and observation."""
-
-    thought: str
-    action: Optional[str] = None
-    action_input: Optional[Dict] = None
-    observation: Optional[str] = None
-    timestamp: str = None
-
-    def __post_init__(self):
-        if self.timestamp is None:
-            self.timestamp = datetime.now().isoformat()
-
-    def to_dict(self) -> Dict:
-        """Convert to dictionary for serialization."""
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: Dict) -> "ReasoningStep":
-        """Reconstruct from dictionary."""
-        return cls(**data)
+    NONE = "none"
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
 
 
 class AgentState(TypedDict):
-    """State schema for the ReAct agent workflow."""
+    """Sophisticated state schema with interrupt-aware architecture."""
 
-    messages: Annotated[List, add_messages]
-    reasoning_steps: List[ReasoningStep]
+    messages: Annotated[List[BaseMessage], add_messages]
+    reasoning_steps: List[Dict[str, Any]]
     current_thought: str
     iteration_count: int
     max_iterations: int
     final_answer: Optional[str]
+    interrupt_decision: str
+    pending_tool_call: Optional[Dict[str, Any]]
+    interrupt_message: Optional[str]
+    awaiting_tool_approval: bool
+    tool_call_mapping: Dict[str, str]  # Maps tool calls to their IDs
+    rejected_tools: List[str]  # Track rejected tools
+    rejection_reasons: Dict[str, str]
+
+
+@dataclass
+class ToolSafetyProfile:
+    """Encapsulates tool safety configuration with semantic clarity."""
+
+    tool_name: str
+    requires_approval: bool
+    risk_level: Literal["low", "medium", "high", "critical"]
+    approval_prompt: str
+    risk_rationale: str
+
+    def format_approval_request(self, tool_input: Dict[str, Any]) -> str:
+        """Generate contextually rich approval request with elegant formatting."""
+        input_display = json.dumps(tool_input, indent=2)
+
+        return (
+            f"## 🔐 Human Approval Required\n\n"
+            f"**Tool:** `{self.tool_name}`\n"
+            f"**Risk Level:** {self.risk_level.upper()}\n"
+            f"**Rationale:** {self.risk_rationale}\n\n"
+            f"### Requested Operation\n"
+            f"```json\n{input_display}\n```\n\n"
+            f"{self.approval_prompt}\n\n"
+            f"**Please approve or reject this operation.**"
+        )
+
+
+class ToolSafetyRegistry:
+    """Centralized tool safety management with extensible architecture."""
+
+    def __init__(self):
+        self._profiles: Dict[str, ToolSafetyProfile] = {}
+        self._initialize_safety_profiles()
+
+    def _initialize_safety_profiles(self):
+        """Configure comprehensive safety profiles with semantic precision."""
+        self.register_profile(
+            ToolSafetyProfile(
+                tool_name="calculate_mathematical_expression",
+                requires_approval=True,
+                risk_level="medium",
+                approval_prompt="This will execute a mathematical calculation using Python's eval function.",
+                risk_rationale="Potential code execution vulnerability through eval()",
+            )
+        )
+
+        self.register_profile(
+            ToolSafetyProfile(
+                tool_name="search_knowledge_base",
+                requires_approval=False,
+                risk_level="low",
+                approval_prompt="",
+                risk_rationale="Read-only operation on curated knowledge base",
+            )
+        )
+
+        self.register_profile(
+            ToolSafetyProfile(
+                tool_name="get_current_timestamp",
+                requires_approval=False,
+                risk_level="low",
+                approval_prompt="",
+                risk_rationale="System time access with no side effects",
+            )
+        )
+
+    def register_profile(self, profile: ToolSafetyProfile):
+        """Register tool safety profile with validation."""
+        self._profiles[profile.tool_name] = profile
+
+    def requires_approval(self, tool_name: str) -> bool:
+        """Determine approval requirement with fail-safe default."""
+        profile = self._profiles.get(tool_name)
+        return profile.requires_approval if profile else True
+
+    def generate_approval_request(
+        self, tool_name: str, tool_input: Dict[str, Any]
+    ) -> str:
+        """Generate formatted approval request with graceful fallback."""
+        profile = self._profiles.get(tool_name)
+
+        if not profile:
+            return (
+                f"## ⚠️ Unregistered Tool Approval Required\n\n"
+                f"**Tool:** `{tool_name}` (UNREGISTERED)\n"
+                f"**Input:** ```json\n{json.dumps(tool_input, indent=2)}\n```\n\n"
+                f"This tool is not in the safety registry. Proceed with extreme caution."
+            )
+
+        return profile.format_approval_request(tool_input)
 
 
 class ReActPrompts:
-    """Curated prompts for the ReAct reasoning pattern."""
+    """Sophisticated prompt engineering with semantic precision."""
 
-    REACT_SYSTEM_PROMPT = """You are a sophisticated ReAct agent that follows the Reasoning and Acting pattern.
+    SYSTEM_TEMPLATE = """You are an advanced ReAct agent implementing sophisticated reasoning and action patterns.
 
-For each step, you must structure your response exactly as follows:
+Your responses must follow this exact structure:
 
-Thought: [Your reasoning about what to do next]
-Action: [The action name from available tools, or "Final Answer"]
-Action Input: [The input for the action as a JSON object]
+Thought: [Analytical reasoning about the current situation and next steps]
+Action: [Tool name from available tools, or "Final Answer"]
+Action Input: [Valid JSON object for the tool]
 
-Available actions:
+Available tools:
 {tool_descriptions}
 
-Key principles:
-- Always start with a "Thought" to reason about the current situation
-- Use "Action" to specify what tool to use or "Final Answer" to conclude
-- Provide "Action Input" as a proper JSON object
-- After receiving an observation, think about what it means before proceeding
-- You have a maximum of {max_iterations} iterations to solve the problem
-- If no tools can satisfly the request, provide a reasoned "Final Answer"
+Operational constraints:
+- Maximum iterations: {max_iterations}
+- Always begin with analytical thought
+- Provide well-formed JSON for Action Input
+- Use "Final Answer" action to conclude
 
-Example format:
-Thought: I need to search for information about the user's question.
-Action: search_tool
-Action Input: {{"query": "example search"}}
+Example interaction:
+Thought: The user needs mathematical computation. I'll calculate using the appropriate tool.
+Action: calculate_mathematical_expression
+Action Input: {{"expression": "42 * 17"}}
 
-When you have enough information to answer the question:
-Thought: I now have sufficient information to provide a comprehensive answer.
+For conclusions:
+Thought: I have gathered sufficient information to provide a comprehensive response.
 Action: Final Answer
-Action Input: {{"answer": "Your final answer here"}}
+Action Input: {{"answer": "Based on my analysis, [detailed response]"}}
 """
 
     @classmethod
     def format_system_prompt(
         cls, tools: List[BaseTool], max_iterations: int = 10
     ) -> str:
-        """Formats the system prompt with available tools."""
+        """Generate formatted system prompt with semantic clarity."""
         tool_descriptions = "\n".join(
-            [f"- {tool.name}: {tool.description}" for tool in tools]
+            f"- {tool.name}: {tool.description}" for tool in tools
         )
-        return cls.REACT_SYSTEM_PROMPT.format(
+
+        return cls.SYSTEM_TEMPLATE.format(
             tool_descriptions=tool_descriptions, max_iterations=max_iterations
         )
 
 
-# Example Tools for Demonstration
+class MessageSerializer:
+    """Elegant message serialization with proper type handling."""
+
+    @staticmethod
+    def serialize_for_llm(message: BaseMessage) -> Dict[str, str]:
+        """Convert BaseMessage to LLM-compatible format with type safety."""
+        if isinstance(message, SystemMessage):
+            return {"role": "system", "content": message.content}
+        elif isinstance(message, HumanMessage):
+            return {"role": "user", "content": message.content}
+        elif isinstance(message, AIMessage):
+            return {"role": "assistant", "content": message.content}
+        elif isinstance(message, ToolMessage):
+            # For LLM context, represent tool results as system messages
+            return {
+                "role": "system",
+                "content": f"Tool Result ({message.name or 'unknown'}): {message.content}",
+            }
+        else:
+            return {"role": "system", "content": str(message.content)}
+
+    @staticmethod
+    def deserialize_from_checkpoint(messages: List[Any]) -> List[BaseMessage]:
+        """Reconstruct BaseMessage objects from checkpoint data with robustness."""
+        reconstructed = []
+
+        for msg in messages:
+            try:
+                if isinstance(msg, BaseMessage):
+                    reconstructed.append(msg)
+                elif isinstance(msg, dict):
+                    # Handle dictionary representations
+                    msg_type = msg.get("type", "").lower()
+                    content = msg.get("content", "")
+
+                    if msg_type == "human":
+                        reconstructed.append(HumanMessage(content=content))
+                    elif msg_type == "ai":
+                        reconstructed.append(AIMessage(content=content))
+                    elif msg_type == "tool":
+                        # Ensure tool_call_id exists
+                        tool_call_id = msg.get("tool_call_id", str(uuid.uuid4()))
+                        reconstructed.append(
+                            ToolMessage(
+                                content=content,
+                                tool_call_id=tool_call_id,
+                                name=msg.get("name", "unknown"),
+                            )
+                        )
+                    else:
+                        reconstructed.append(SystemMessage(content=content))
+                else:
+                    # Fallback for unknown types
+                    reconstructed.append(SystemMessage(content=str(msg)))
+
+            except Exception as e:
+                logger.warning(f"Message deserialization warning: {e}")
+                reconstructed.append(SystemMessage(content=str(msg)))
+
+        return reconstructed
+
+
+class ReActAgent:
+    """Production-grade ReAct agent with sophisticated interrupt mechanics."""
+
+    def __init__(
+        self,
+        llm: Optional[ChatOpenAI] = None,
+        tools: Optional[List[BaseTool]] = None,
+        max_iterations: int = 10,
+        mongodb_uri: str = "mongodb://localhost:27017",
+        db_name: str = "langgraph_checkpoints",
+        checkpoint_collection_name: str = "checkpoints",
+        writes_collection_name: str = "checkpoint_writes",
+        use_persistence: bool = True,
+        enable_human_interrupts: bool = True,
+    ):
+        self.llm = llm or ChatOpenAI(model="gpt-4", temperature=0)
+        self.tools = tools or self._default_tools()
+        self.max_iterations = max_iterations
+        self.enable_human_interrupts = enable_human_interrupts
+        self.tool_safety_registry = ToolSafetyRegistry()
+        self.message_serializer = MessageSerializer()
+
+        # MongoDB configuration
+        self.mongodb_uri = mongodb_uri
+        self.db_name = db_name
+        self.checkpoint_collection_name = checkpoint_collection_name
+        self.writes_collection_name = writes_collection_name
+        self.use_persistence = use_persistence
+
+        # Initialize components
+        self.checkpointer = None
+        self.workflow = None
+        self._tool_executor_map = {tool.name: tool for tool in self.tools}
+
+        if not use_persistence:
+            self.checkpointer = MemorySaver()
+            self.workflow = self._construct_workflow()
+
+    @staticmethod
+    def _default_tools() -> List[BaseTool]:
+        """Provide default tool suite with semantic clarity."""
+        return [
+            search_knowledge_base,
+            calculate_mathematical_expression,
+            get_current_timestamp,
+        ]
+
+    def __enter__(self):
+        """Context manager entry with elegant resource management."""
+        if self.use_persistence:
+            self._mongodb_context = MongoDBSaver.from_conn_string(
+                conn_string=self.mongodb_uri,
+                db_name=self.db_name,
+                checkpoint_collection_name=self.checkpoint_collection_name,
+                writes_collection_name=self.writes_collection_name,
+            )
+            self.checkpointer = self._mongodb_context.__enter__()
+            logger.info(f"Initialized MongoDB checkpointer: {self.db_name}")
+        else:
+            self.checkpointer = MemorySaver()
+
+        self.workflow = self._construct_workflow()
+
+        # print(self.workflow.get_graph().draw_mermaid())
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Clean context manager exit with proper resource cleanup."""
+        if hasattr(self, "_mongodb_context"):
+            self._mongodb_context.__exit__(exc_type, exc_val, exc_tb)
+
+    def _construct_workflow(self) -> StateGraph:
+        """Construct interrupt-aware workflow with architectural elegance."""
+        if not self.checkpointer:
+            raise RuntimeError(
+                "Checkpointer must be initialized before workflow construction"
+            )
+
+        workflow = StateGraph(AgentState)
+
+        # Define nodes with clear semantic responsibilities
+        workflow.add_node("reasoning_engine", self._reasoning_node)
+        workflow.add_node("tool_selector", self._tool_selector_node)
+        workflow.add_node("approval_checkpoint", self._approval_checkpoint_node)
+        workflow.add_node("tool_executor", self._tool_executor_node)
+        workflow.add_node("synthesizer", self._synthesis_node)
+        workflow.add_node("smart_continuation", self._smart_continuation_node)
+
+        workflow.add_edge(START, "reasoning_engine")
+        workflow.add_edge("smart_continuation", "reasoning_engine")
+
+        workflow.add_conditional_edges(
+            "reasoning_engine",
+            self._route_from_reasoning,
+            {
+                "select_tool": "tool_selector",
+                "synthesize": "synthesizer",
+                "continue_smartly": "smart_continuation",
+                "error": END,
+            },
+        )
+
+        workflow.add_conditional_edges(
+            "tool_selector",
+            self._route_from_selector,
+            {
+                "needs_approval": "approval_checkpoint",
+                "execute_directly": "tool_executor",
+                "error": END,
+            },
+        )
+
+        workflow.add_conditional_edges(
+            "approval_checkpoint",
+            self._route_from_approval,
+            {
+                "await_approval": END,
+                "proceed": "tool_executor",
+                "reject": "smart_continuation",
+            },
+        )
+
+        workflow.add_edge("tool_executor", "reasoning_engine")
+        workflow.add_edge("synthesizer", END)
+
+        # Compile with interrupt configuration
+        interrupt_nodes = (
+            ["approval_checkpoint"] if self.enable_human_interrupts else []
+        )
+
+        return workflow.compile(
+            checkpointer=self.checkpointer, interrupt_before=interrupt_nodes
+        )
+
+    def _reasoning_node(self, state: AgentState) -> Dict[str, Any]:
+        """Core reasoning engine with sophisticated state management."""
+        """
+        # Handle rejection flow with elegance
+        if state.get("interrupt_decision") == InterruptDecision.REJECTED.value:
+            pending_tool = state.get("pending_tool_call", {})
+            rejected_tool = pending_tool.get("tool_name")
+
+            # Track rejected tools
+            rejected_tools = state.get("rejected_tools", [])
+            rejection_reasons = state.get("rejection_reasons", {})
+
+            if rejected_tool and rejected_tool not in rejected_tools:
+                rejected_tools.append(rejected_tool)
+                rejection_reasons[rejected_tool] = "User rejected during approval process"
+
+            if rejected_tool:
+                rejection_message = (
+                    f"I understand you've rejected the {rejected_tool} tool execution. "
+                    f"I'll find an alternative approach to complete your request without using {rejected_tool}."
+                )
+            else:
+                rejection_message = (
+                    "I understand you've rejected the tool execution. "
+                    "Let me provide an alternative approach."
+                )
+
+            return {
+                "messages": [AIMessage(content=rejection_message)],
+                "interrupt_decision": InterruptDecision.NONE.value,
+                "pending_tool_call": None,
+                "awaiting_tool_approval": False,
+                "rejected_tools": rejected_tools,
+                "rejection_reasons": rejection_reasons,
+            }
+        """
+        guidance = state.get("continuation_guidance")
+        if guidance:
+            # Add guidance to system prompt
+            system_prompt = self._build_guided_system_prompt(state, guidance)
+        else:
+            system_prompt = ReActPrompts.format_system_prompt(
+                self.tools, self.max_iterations
+            )
+        # Check iteration limits
+        if state["iteration_count"] >= state["max_iterations"]:
+            return {
+                "messages": [AIMessage(content="Maximum iterations reached.")],
+                "final_answer": "I've reached the maximum number of reasoning steps.",
+            }
+
+        # Prepare messages for LLM with proper serialization
+        current_messages = state["messages"]
+        system_prompt = self._build_enhanced_system_prompt(state)
+
+        # Use message serializer for proper formatting
+        formatted_messages = [
+            {"role": "system", "content": system_prompt},
+            *[
+                self.message_serializer.serialize_for_llm(msg)
+                for msg in current_messages
+            ],
+        ]
+
+        # Generate reasoning response
+        response = self.llm.invoke(formatted_messages)
+        parsed = self._parse_react_output(response.content)
+
+        # Create reasoning step record
+        reasoning_step = {
+            "thought": parsed.get("thought", ""),
+            "action": parsed.get("action"),
+            "action_input": parsed.get("action_input"),
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        # Prepare state update
+        state_update = {
+            "messages": [response],
+            "reasoning_steps": state["reasoning_steps"] + [reasoning_step],
+            "current_thought": reasoning_step["thought"],
+            "iteration_count": state["iteration_count"] + 1,
+        }
+
+        # Handle final answer
+        if reasoning_step["action"] == "Final Answer":
+            answer_content = (
+                reasoning_step["action_input"].get("answer", "")
+                if reasoning_step["action_input"]
+                else ""
+            )
+            state_update["final_answer"] = answer_content
+
+        return state_update
+
+    def _build_guided_system_prompt(self, state: AgentState, guidance: str) -> str:
+        """Build system prompt with continuation guidance."""
+
+        base_prompt = ReActPrompts.format_system_prompt(self.tools, self.max_iterations)
+        rejected_tools = state.get("rejected_tools", [])
+
+        additional_guidance = f"""
+
+        IMPORTANT CONTEXT:
+        - Some tools were rejected: {', '.join(rejected_tools)}
+        - Focus on: {guidance}
+        - Continue helping the user with what you CAN do
+        - Don't mention rejected tools unless necessary
+        """
+
+        return base_prompt + additional_guidance
+
+    def _smart_continuation_node(self, state: AgentState) -> Dict[str, Any]:
+        """Smart continuation when tools are rejected."""
+
+        pending_tool = state.get("pending_tool_call", {})
+        rejected_tool = pending_tool.get("tool_name", "")
+
+        # Get original user request
+        original_query = ""
+        for msg in state["messages"]:
+            if isinstance(msg, HumanMessage):
+                original_query = msg.content
+                break
+
+        # Track rejected tools
+        rejected_tools = state.get("rejected_tools", [])
+        if rejected_tool and rejected_tool not in rejected_tools:
+            rejected_tools.append(rejected_tool)
+
+        # Ask LLM what else can be done
+        continuation_prompt = f"""
+        The user asked: "{original_query}"
+        The {rejected_tool} tool was rejected.
+
+        What other parts of their request can I still help with?
+        Can I provide alternatives for the rejected part?
+
+        Respond with JSON:
+        {{
+            "can_continue": true/false,
+            "user_message": "What to tell the user",
+            "next_focus": "What to focus on next"
+        }}
+        """
+
+        try:
+            response = self.llm.invoke(
+                [{"role": "user", "content": continuation_prompt}]
+            )
+            import json
+
+            plan = json.loads(response.content)
+
+            user_message = plan.get("user_message", "Let me help with what I can do.")
+
+            return {
+                "messages": [AIMessage(content=user_message)],
+                "rejected_tools": rejected_tools,
+                "continuation_guidance": plan.get("next_focus"),
+                "interrupt_decision": InterruptDecision.NONE.value,
+                "pending_tool_call": None,
+                "awaiting_tool_approval": False,
+            }
+
+        except Exception as e:
+            # Fallback
+            return {
+                "messages": [
+                    AIMessage(
+                        content=f"I understand the {rejected_tool} tool was rejected. Let me continue with what I can do."
+                    )
+                ],
+                "rejected_tools": rejected_tools,
+                "interrupt_decision": InterruptDecision.NONE.value,
+                "pending_tool_call": None,
+                "awaiting_tool_approval": False,
+            }
+
+    def _tool_selector_node(self, state: AgentState) -> Dict[str, Any]:
+        """Intelligent tool selection with safety evaluation."""
+        # Check if we've already approved this tool
+        if state.get("interrupt_decision") == InterruptDecision.APPROVED.value:
+            # Tool was already approved, pass through
+            return state
+
+        latest_step = state["reasoning_steps"][-1] if state["reasoning_steps"] else None
+
+        if not latest_step:
+            return state
+
+        tool_name = latest_step.get("action")
+        tool_input = latest_step.get("action_input", {})
+
+        if not tool_name or tool_name == "Final Answer":
+            return state
+
+        # Check if this tool was previously rejected
+        rejected_tools = state.get("rejected_tools", [])
+        if tool_name in rejected_tools:
+            rejection_reason = state.get("rejection_reasons", {}).get(
+                tool_name, "Previously rejected"
+            )
+
+            # Add a message indicating the tool was skipped
+            skip_message = (
+                f"Skipping {tool_name} tool as it was previously rejected. "
+                f"Reason: {rejection_reason}"
+            )
+
+            return {
+                "messages": [AIMessage(content=skip_message)],
+            }
+
+        # Generate unique tool call ID
+        tool_call_id = str(uuid.uuid4())
+
+        # Update tool call mapping
+        tool_call_mapping = state.get("tool_call_mapping", {})
+        tool_call_mapping[tool_call_id] = tool_name
+
+        # Check if tool requires approval
+        if self.tool_safety_registry.requires_approval(tool_name):
+            approval_message = self.tool_safety_registry.generate_approval_request(
+                tool_name, tool_input
+            )
+
+            logger.info(
+                f"🔐 Tool '{tool_name}' requires approval - flagging for interrupt"
+            )
+
+            return {
+                "interrupt_decision": InterruptDecision.PENDING.value,
+                "pending_tool_call": {
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                    "tool_call_id": tool_call_id,
+                    "timestamp": datetime.now().isoformat(),
+                },
+                "interrupt_message": approval_message,
+                "awaiting_tool_approval": True,
+                "tool_call_mapping": tool_call_mapping,
+                "messages": [
+                    AIMessage(
+                        content=approval_message,
+                        additional_kwargs={
+                            "requires_approval": True,
+                            "tool_name": tool_name,
+                        },
+                    )
+                ],
+            }
+
+        # Tool doesn't require approval - add to pending call
+        return {
+            "pending_tool_call": {
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                "tool_call_id": tool_call_id,
+                "timestamp": datetime.now().isoformat(),
+            },
+            "tool_call_mapping": tool_call_mapping,
+        }
+
+    def _approval_checkpoint_node(self, state: AgentState) -> Dict[str, Any]:
+        """Approval checkpoint with elegant state transitions."""
+        interrupt_decision = state.get(
+            "interrupt_decision", InterruptDecision.NONE.value
+        )
+
+        if interrupt_decision == InterruptDecision.APPROVED.value:
+            logger.info("✅ Tool execution approved by human")
+            return {
+                "interrupt_decision": InterruptDecision.NONE.value,
+                "awaiting_tool_approval": False,
+            }
+
+        if interrupt_decision == InterruptDecision.REJECTED.value:
+            logger.info("❌ Tool execution rejected by human")
+            return {
+                "interrupt_decision": InterruptDecision.REJECTED.value,
+                "awaiting_tool_approval": False,
+                "pending_tool_call": None,
+            }
+
+        return state
+
+    def _tool_executor_node(self, state: AgentState) -> Dict[str, Any]:
+        """Execute approved tools with comprehensive error handling."""
+        pending_tool = state.get("pending_tool_call")
+
+        if not pending_tool:
+            latest_step = (
+                state["reasoning_steps"][-1] if state["reasoning_steps"] else None
+            )
+            if latest_step:
+                tool_call_id = str(uuid.uuid4())
+                pending_tool = {
+                    "tool_name": latest_step.get("action"),
+                    "tool_input": latest_step.get("action_input", {}),
+                    "tool_call_id": tool_call_id,
+                }
+
+        if not pending_tool or not pending_tool.get("tool_name"):
+            return state
+
+        tool_name = pending_tool["tool_name"]
+        tool_input = pending_tool["tool_input"]
+        tool_call_id = pending_tool.get("tool_call_id", str(uuid.uuid4()))
+
+        # Execute the tool
+        tool_executor = self._tool_executor_map.get(tool_name)
+
+        if not tool_executor:
+            error_msg = f"Tool '{tool_name}' not found in executor map"
+            logger.error(error_msg)
+            return {
+                "messages": [AIMessage(content=error_msg)],
+                "pending_tool_call": None,
+            }
+
+        try:
+            result = tool_executor.invoke(tool_input)
+
+            # Create proper ToolMessage with required tool_call_id
+            tool_message = ToolMessage(
+                content=str(result), tool_call_id=tool_call_id, name=tool_name
+            )
+
+            return {
+                "messages": [tool_message],
+                "pending_tool_call": None,
+                "awaiting_tool_approval": False,
+            }
+
+        except Exception as e:
+            error_msg = f"Tool execution error: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+
+            return {
+                "messages": [AIMessage(content=error_msg)],
+                "pending_tool_call": None,
+                "awaiting_tool_approval": False,
+            }
+
+    def _synthesis_node(self, state: AgentState) -> Dict[str, Any]:
+        """Enhanced synthesis showing tool usage."""
+
+        # Get and clean the final answer
+        final_answer = state.get("final_answer", "")
+
+        if not final_answer:
+            for msg in reversed(state["messages"]):
+                if isinstance(msg, AIMessage) and "Final Answer" in msg.content:
+                    # Extract just the answer content, not the full ReAct format
+                    content = msg.content
+                    if "Action Input:" in content:
+                        # Parse the JSON to get clean answer
+                        try:
+                            import re
+
+                            json_match = re.search(
+                                r"Action Input:\s*({.*?})", content, re.DOTALL
+                            )
+                            if json_match:
+                                import json
+
+                                action_input = json.loads(json_match.group(1))
+                                final_answer = action_input.get("answer", content)
+                            else:
+                                final_answer = content
+                        except:
+                            final_answer = content
+                    else:
+                        final_answer = content
+                    break
+
+        if not final_answer:
+            final_answer = "I've completed the analysis of your request."
+
+        # Check what tools were executed
+        executed_tools = {}
+        rejected_tools = state.get("rejected_tools", [])
+
+        # Look at tool messages, but only from the current conversation
+        current_conversation_tools = []
+        tool_messages = [
+            msg for msg in state["messages"] if isinstance(msg, ToolMessage)
+        ]
+
+        # Get only the most recent execution of each tool type
+        tool_results = {}
+        for tool_msg in reversed(tool_messages):  # Start from most recent
+            if tool_msg.name not in tool_results:
+                tool_results[tool_msg.name] = tool_msg.content
+
+        # Format tool summary
+        if tool_results:
+            enhanced_parts = [final_answer, "\n**Tools Executed:**"]
+            for tool_name, result in tool_results.items():
+                enhanced_parts.append(f"• ✅ {tool_name}: {result}")
+        else:
+            enhanced_parts = [final_answer]
+
+        if rejected_tools:
+            enhanced_parts.append(f"\n**Tools Rejected:** {', '.join(rejected_tools)}")
+
+        enhanced_answer = "\n".join(enhanced_parts)
+
+        synthesis_message = AIMessage(
+            content=enhanced_answer, additional_kwargs={"synthesized": True}
+        )
+
+        return {"messages": [synthesis_message]}
+
+    def _route_from_reasoning(self, state: AgentState) -> str:
+        """Route from reasoning with semantic clarity."""
+        if state.get("interrupt_decision") == InterruptDecision.REJECTED.value:
+            return "continue_smartly"
+
+        if state.get("final_answer"):
+            return "synthesize"
+
+        if state["iteration_count"] >= state["max_iterations"]:
+            return "error"
+
+        latest_step = state["reasoning_steps"][-1] if state["reasoning_steps"] else None
+        if (
+            latest_step
+            and latest_step.get("action")
+            and latest_step["action"] != "Final Answer"
+        ):
+            return "select_tool"
+
+        return "synthesize"
+
+    def _route_from_selector(self, state: AgentState) -> str:
+        """Route from tool selector based on safety requirements."""
+        # If already approved, go directly to execution
+        if state.get("interrupt_decision") == InterruptDecision.APPROVED.value:
+            return "execute_directly"
+
+        if state.get("awaiting_tool_approval"):
+            return "needs_approval"
+
+        latest_step = state["reasoning_steps"][-1] if state["reasoning_steps"] else None
+        if latest_step and latest_step.get("action"):
+            tool_name = latest_step["action"]
+            if not self.tool_safety_registry.requires_approval(tool_name):
+                return "execute_directly"
+
+        return "error"
+
+    def _route_from_approval(self, state: AgentState) -> str:
+        """Route from approval checkpoint with clear decision logic."""
+        interrupt_decision = state.get(
+            "interrupt_decision", InterruptDecision.NONE.value
+        )
+
+        if interrupt_decision == InterruptDecision.APPROVED.value:
+            return "proceed"
+        elif interrupt_decision == InterruptDecision.REJECTED.value:
+            return "reject"
+        elif state.get("awaiting_tool_approval"):
+            return "await_approval"
+
+        return "proceed"
+
+    def _parse_react_output(self, content: str) -> Dict[str, Any]:
+        """Parse ReAct-formatted output with robust pattern matching."""
+        patterns = {
+            "thought": r"Thought:\s*(.*?)(?=\nAction:|$)",
+            "action": r"Action:\s*(.*?)(?=\nAction Input:|$)",
+            "action_input": r"Action Input:\s*(.*?)(?=\n|$)",
+        }
+
+        parsed = {}
+
+        for key, pattern in patterns.items():
+            match = re.search(pattern, content, re.DOTALL | re.MULTILINE)
+            if match:
+                value = match.group(1).strip()
+
+                if key == "action_input":
+                    try:
+                        parsed[key] = json.loads(value)
+                    except json.JSONDecodeError:
+                        json_match = re.search(r"\{.*\}", value, re.DOTALL)
+                        if json_match:
+                            try:
+                                parsed[key] = json.loads(json_match.group(0))
+                            except:
+                                parsed[key] = {"input": value}
+                        else:
+                            parsed[key] = {"input": value}
+                else:
+                    parsed[key] = value
+
+        return parsed
+
+    def create_session_config(
+        self,
+        session_id: Optional[str] = None,
+        namespace: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create properly formatted session configuration."""
+        if not session_id:
+            session_id = f"session_{uuid.uuid4().hex[:8]}"
+
+        config = {
+            "configurable": {
+                "thread_id": session_id,
+            }
+        }
+
+        if namespace:
+            config["configurable"]["checkpoint_ns"] = namespace
+
+        if user_id:
+            config["configurable"]["user_id"] = user_id
+
+        return config
+
+    def invoke(
+        self,
+        query: str,
+        config: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        namespace: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Execute query with full interrupt support and elegant error handling."""
+        if not config:
+            config = self.create_session_config(session_id, namespace)
+
+        logger.info(f"Processing query with config: {config}")
+
+        # Check for existing state
+        existing_state = None
+        try:
+            checkpoint_tuple = self.checkpointer.get_tuple(config)
+            if checkpoint_tuple:
+                existing_state = checkpoint_tuple.checkpoint.get("channel_values", {})
+
+                # Deserialize messages properly
+                if "messages" in existing_state:
+                    existing_state["messages"] = (
+                        self.message_serializer.deserialize_from_checkpoint(
+                            existing_state["messages"]
+                        )
+                    )
+
+                # Check for pending interrupt
+                if existing_state.get("awaiting_tool_approval"):
+                    logger.info(
+                        "⚠️ Session has pending interrupt - returning interrupt state"
+                    )
+                    return {
+                        "interrupted": True,
+                        "interrupt_message": existing_state.get("interrupt_message"),
+                        "pending_tool": existing_state.get("pending_tool_call"),
+                        "session_id": config["configurable"]["thread_id"],
+                    }
+        except Exception as e:
+            logger.error(f"Error retrieving checkpoint: {e}")
+
+        # Prepare initial state
+        if existing_state:
+            initial_state = {
+                **existing_state,
+                "messages": existing_state.get("messages", [])
+                + [HumanMessage(content=query)],
+                "reasoning_steps": [],
+                "iteration_count": 0,
+                "current_thought": "",
+                "final_answer": None,
+                "tool_call_mapping": existing_state.get("tool_call_mapping", {}),
+            }
+        else:
+            initial_state = {
+                "messages": [HumanMessage(content=query)],
+                "reasoning_steps": [],
+                "current_thought": "",
+                "iteration_count": 0,
+                "max_iterations": self.max_iterations,
+                "final_answer": None,
+                "interrupt_decision": InterruptDecision.NONE.value,
+                "pending_tool_call": None,
+                "interrupt_message": None,
+                "awaiting_tool_approval": False,
+                "tool_call_mapping": {},
+            }
+
+        # Execute workflow
+        try:
+            result = self.workflow.invoke(initial_state, config=config)
+
+            # Check if we're in an interrupt state
+            if result.get("awaiting_tool_approval"):
+                logger.info("🛑 Workflow interrupted for approval")
+                return {
+                    "interrupted": True,
+                    "interrupt_message": result.get("interrupt_message"),
+                    "pending_tool": result.get("pending_tool_call"),
+                    "session_id": config["configurable"]["thread_id"],
+                }
+
+            # Normal completion
+            return {
+                "messages": result.get("messages", []),
+                "final_answer": result.get("final_answer"),
+                "session_id": config["configurable"]["thread_id"],
+            }
+
+        except Exception as e:
+            logger.error(f"Workflow execution error: {e}", exc_info=True)
+            return {
+                "error": str(e),
+                "messages": [AIMessage(content=f"An error occurred: {str(e)}")],
+                "session_id": config["configurable"]["thread_id"],
+            }
+
+    def resume_with_approval(
+        self,
+        session_id: str,
+        approved: bool,
+        namespace: Optional[str] = None,
+        rejection_reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Resume interrupted workflow with approval decision."""
+        config = self.create_session_config(session_id, namespace)
+
+        # Update state with decision
+        state_update = {
+            "interrupt_decision": (
+                InterruptDecision.APPROVED.value
+                if approved
+                else InterruptDecision.REJECTED.value
+            )
+        }
+
+        if not approved and rejection_reason:
+            state_update["messages"] = [
+                AIMessage(content=f"Tool execution rejected: {rejection_reason}")
+            ]
+
+        logger.info(
+            f"{'✅ Approving' if approved else '❌ Rejecting'} "
+            f"interrupt for session {session_id}"
+        )
+
+        # Resume workflow
+        try:
+            result = self.workflow.invoke(state_update, config=config)
+
+            return {
+                "messages": result.get("messages", []),
+                "final_answer": result.get("final_answer"),
+                "session_id": session_id,
+            }
+
+        except Exception as e:
+            logger.error(f"Resume error: {e}", exc_info=True)
+            return {
+                "error": str(e),
+                "messages": [AIMessage(content=f"Resume error: {str(e)}")],
+                "session_id": session_id,
+            }
+
+    def get_interrupt_status(
+        self, session_id: str, namespace: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Check session interrupt status with comprehensive error handling."""
+        config = self.create_session_config(session_id, namespace)
+
+        try:
+            checkpoint_tuple = self.checkpointer.get_tuple(config)
+
+            if not checkpoint_tuple:
+                return {"has_interrupt": False, "reason": "No checkpoint found"}
+
+            state = checkpoint_tuple.checkpoint.get("channel_values", {})
+
+            # Only return interrupt if it's still pending
+            if (
+                state.get("awaiting_tool_approval")
+                and state.get("interrupt_decision") != InterruptDecision.APPROVED.value
+            ):
+                return {
+                    "has_interrupt": True,
+                    "interrupt_message": state.get("interrupt_message"),
+                    "pending_tool": state.get("pending_tool_call"),
+                    "session_id": session_id,
+                }
+
+            return {"has_interrupt": False}
+
+        except Exception as e:
+            logger.error(f"Status check error: {e}")
+            return {"has_interrupt": False, "error": str(e)}
+
+    def _build_enhanced_system_prompt(self, state: AgentState) -> str:
+        """Build system prompt with rejection context."""
+        base_prompt = ReActPrompts.format_system_prompt(self.tools, self.max_iterations)
+
+        # Add rejection context if any tools were rejected
+        rejected_tools = state.get("rejected_tools", [])
+        if rejected_tools:
+            rejection_context = (
+                f"\n\nIMPORTANT: The following tools have been rejected by the user "
+                f"and should NOT be used: {', '.join(rejected_tools)}. "
+                f"Find alternative approaches that don't require these tools."
+            )
+            base_prompt += rejection_context
+
+        return base_prompt
+
+
+# Tool definitions with proper decorators
 @tool
 def search_knowledge_base(query: str) -> str:
     """Search a knowledge base for relevant information."""
@@ -137,15 +1131,21 @@ def search_knowledge_base(query: str) -> str:
 def calculate_mathematical_expression(expression: str) -> str:
     """Safely evaluate mathematical expressions."""
     try:
-        if any(char in expression for char in ["import", "exec", "eval", "__"]):
-            return "Error: Invalid expression detected."
+        # Security check
+        if any(
+            dangerous in expression for dangerous in ["import", "exec", "eval", "__"]
+        ):
+            return "Error: Expression contains potentially dangerous constructs."
 
+        # Character whitelist
         allowed_chars = set("0123456789+-*/()., ")
         if not all(c in allowed_chars for c in expression):
             return "Error: Expression contains invalid characters."
 
+        # Evaluate safely
         result = eval(expression)
         return f"Mathematical Result: {result}"
+
     except Exception as e:
         return f"Calculation Error: {str(e)}"
 
@@ -156,692 +1156,333 @@ def get_current_timestamp() -> str:
     return f"Current Timestamp: {datetime.now().isoformat()}"
 
 
-class ReActAgent:
-    """Production-grade ReAct Agent with official MongoDB persistence."""
+def demonstrate_interrupt_workflow():
+    """Demonstrate human-in-the-loop workflow with interrupts."""
 
-    def __init__(
-        self,
-        llm: Optional[ChatOpenAI] = None,
-        tools: Optional[List[BaseTool]] = None,
-        max_iterations: int = 10,
-        mongodb_uri: str = "mongodb://localhost:27017",
-        db_name: str = "langgraph_checkpoints",
-        checkpoint_collection_name: str = "checkpoints",
-        writes_collection_name: str = "checkpoint_writes",
-        use_persistence: bool = True,
-    ):
-        self.llm = llm or ChatOpenAI(model="gpt-4", temperature=0)
-        self.tools = tools or [
-            search_knowledge_base,
-            calculate_mathematical_expression,
-            get_current_timestamp,
-        ]
-        self.max_iterations = max_iterations
-
-        self.mongodb_uri = mongodb_uri
-        self.db_name = db_name
-        self.checkpoint_collection_name = checkpoint_collection_name
-        self.writes_collection_name = writes_collection_name
-        self.use_persistence = use_persistence
-
-        self.checkpointer = None
-        self.workflow = None
-        self.tool_node = ToolNode(self.tools)
-
-        if not use_persistence:
-            self.checkpointer = MemorySaver()
-            self.workflow = self._construct_reasoning_workflow()
-
-    def __enter__(self):
-        """Enter context manager for MongoDB checkpointer."""
-        if self.use_persistence:
-            self._mongodb_context = MongoDBSaver.from_conn_string(
-                conn_string=self.mongodb_uri,
-                db_name=self.db_name,
-                checkpoint_collection_name=self.checkpoint_collection_name,
-                writes_collection_name=self.writes_collection_name,
-            )
-            self.checkpointer = self._mongodb_context.__enter__()
-            logger.info(f"Initialized MongoDB checkpointer: {self.db_name}")
-        else:
-            self.checkpointer = MemorySaver()
-
-        self.workflow = self._construct_reasoning_workflow()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Exit context manager."""
-        if hasattr(self, "_mongodb_context"):
-            self._mongodb_context.__exit__(exc_type, exc_val, exc_tb)
-
-    def _construct_reasoning_workflow(self) -> StateGraph:
-        """Construct workflow - only call after checkpointer is initialized."""
-        if self.checkpointer is None:
-            raise RuntimeError(
-                "Checkpointer not initialized. Use agent in context manager."
-            )
-
-        workflow = StateGraph(AgentState)
-
-        workflow.add_node("reasoning_engine", self._reasoning_node)
-        workflow.add_node("action_executor", self.tool_node)
-        workflow.add_node("reflection_synthesizer", self._reflection_node)
-
-        workflow.add_edge(START, "reasoning_engine")
-        workflow.add_conditional_edges(
-            "reasoning_engine",
-            self._routing_decision,
-            {
-                "continue": "action_executor",
-                "finish": "reflection_synthesizer",
-                "error": END,
-            },
-        )
-        workflow.add_edge("action_executor", "reasoning_engine")
-        workflow.add_edge("reflection_synthesizer", END)
-
-        return workflow.compile(checkpointer=self.checkpointer)
-
-    def create_session_config(
-        self,
-        session_id: Optional[str] = None,
-        namespace: Optional[str] = None,
-        user_id: Optional[str] = None,
-    ) -> Dict:
-        """Create session configuration for MongoDB storage."""
-        if session_id is None:
-            session_id = f"session_{uuid.uuid4().hex[:8]}"
-
-        config = {
-            "configurable": {
-                "thread_id": session_id,
-            }
-        }
-
-        # NOTE: Don't set checkpoint_ns if None - LangGraph saves as empty string
-        # Only set it if explicitly provided and not None/empty
-        if namespace and namespace.strip():
-            config["configurable"]["checkpoint_ns"] = namespace
-        # If namespace is None or empty, don't include checkpoint_ns at all
-        # This matches how LangGraph saves documents with empty checkpoint_ns
-
-        if user_id:
-            config["configurable"]["user_id"] = user_id
-
-        logger.info(f"Created MongoDB config: {config}")
-        return config
-
-    def get_session_stats(self, namespace: Optional[str] = None) -> Dict:
-        """Get statistics about stored sessions using MongoDB aggregation."""
-        try:
-            db = self.checkpointer.db
-            checkpoints_collection = db[self.checkpoint_collection_name]
-
-            # Build match filter to handle empty namespace correctly
-            match_filter = {}
-            if namespace:
-                match_filter = {"checkpoint_ns": namespace}
-            else:
-                # Match documents where checkpoint_ns is empty string or doesn't exist
-                match_filter = {
-                    "$or": [
-                        {"checkpoint_ns": ""},
-                        {"checkpoint_ns": {"$exists": False}},
-                    ]
-                }
-
-            pipeline = [
-                {"$match": match_filter},
-                {
-                    "$group": {
-                        "_id": "$thread_id",
-                        "checkpoint_count": {"$sum": 1},
-                        "latest_checkpoint": {"$max": "$checkpoint_id"},
-                        "first_checkpoint": {"$min": "$checkpoint_id"},
-                    }
-                },
-                {
-                    "$group": {
-                        "_id": None,
-                        "total_sessions": {"$sum": 1},
-                        "total_checkpoints": {"$sum": "$checkpoint_count"},
-                        "avg_checkpoints_per_session": {"$avg": "$checkpoint_count"},
-                    }
-                },
-            ]
-
-            result = list(checkpoints_collection.aggregate(pipeline))
-
-            if result:
-                stats = result[0]
-                return {
-                    "total_sessions": stats.get("total_sessions", 0),
-                    "total_checkpoints": stats.get("total_checkpoints", 0),
-                    "avg_checkpoints_per_session": round(
-                        stats.get("avg_checkpoints_per_session", 0), 2
-                    ),
-                    "database": self.db_name,
-                    "checkpoint_collection": self.checkpoint_collection_name,
-                    "writes_collection": self.writes_collection_name,
-                    "namespace_filter": namespace or "empty/default",
-                }
-            else:
-                total_docs = checkpoints_collection.count_documents({})
-                return {
-                    "total_sessions": 0,
-                    "total_checkpoints": 0,
-                    "avg_checkpoints_per_session": 0,
-                    "database": self.db_name,
-                    "checkpoint_collection": self.checkpoint_collection_name,
-                    "writes_collection": self.writes_collection_name,
-                    "namespace_filter": namespace or "empty/default",
-                    "debug_total_docs_in_collection": total_docs,
-                }
-
-        except Exception as e:
-            logger.error(f"Failed to get session stats: {e}")
-            return {"error": str(e)}
-
-    def _extract_conversation_context(self, messages) -> str:
-        """Extract key information from conversation history."""
-        context_parts = []
-
-        for msg in messages[-10:]:  # Look at recent messages
-            if isinstance(msg, HumanMessage):
-                context_parts.append(f"User asked: {msg.content}")
-            elif isinstance(msg, ToolMessage):
-                # Extract key information from tool results
-                content = msg.content
-                if "Result:" in content:
-                    result_part = content.split("Result:")[-1].strip()
-                    context_parts.append(f"Found: {result_part}")
-                else:
-                    context_parts.append(f"Tool result: {content}")
-
-        return "\n".join(context_parts[-5:]) if context_parts else ""
-
-    def _reasoning_node(self, state: AgentState) -> Dict:
-        """Core reasoning engine that processes thoughts and determines actions."""
-        if state["iteration_count"] >= state["max_iterations"]:
-            return {
-                "messages": [
-                    AIMessage(
-                        content="Maximum iterations reached. Concluding analysis."
-                    )
-                ],
-                "final_answer": "Unable to complete task within iteration limit.",
-            }
-
-        # Get the current user query (the most recent HumanMessage)
-        current_query = ""
-        for msg in reversed(state["messages"]):
-            if isinstance(msg, HumanMessage):
-                current_query = msg.content
-                break
-
-        # Extract conversation history and previous results from ALL messages (not just recent)
-        conversation_context = self._extract_conversation_context(state["messages"])
-        all_tool_results = []
-        for msg in state["messages"]:  # Check ALL messages for complete context
-            if isinstance(msg, ToolMessage):
-                all_tool_results.append(msg.content)
-
-        # Check if we can answer directly from conversation history
-        if self._can_answer_from_history(current_query, all_tool_results):
-            logger.info(
-                f"🧠 Answering '{current_query}' directly from conversation history"
-            )
-
-            answer = self._synthesize_answer_from_history(
-                current_query, all_tool_results
-            )
-
-            # Create a reasoning step that uses existing information
-            reasoning_step = ReasoningStep(
-                thought=f"I can answer this question using information already available from our conversation.",
-                action="Final Answer",
-                action_input={"answer": answer},
-            )
-
-            return {
-                "messages": [AIMessage(content=f"Final Answer: {answer}")],
-                "reasoning_steps": state["reasoning_steps"] + [reasoning_step],
-                "current_thought": reasoning_step.thought,
-                "iteration_count": state["iteration_count"] + 1,
-                "final_answer": answer,
-            }
-
-        # If we can't answer from history, proceed with normal ReAct reasoning
-        recent_tool_results = []
-        for msg in state["messages"][-10:]:  # Check recent messages for context
-            if isinstance(msg, ToolMessage):
-                recent_tool_results.append(f"Previous result: {msg.content}")
-
-        # Check recent actions from current reasoning session only
-        recent_actions = []
-        for step in state["reasoning_steps"][
-            -3:
-        ]:  # Only current session reasoning steps
-            if hasattr(step, "action") and step.action:
-                recent_actions.append(step.action)
-            elif isinstance(step, dict) and step.get("action"):
-                recent_actions.append(step["action"])
-
-        # Build enhanced context prompt
-        context_note = ""
-        if all_tool_results:
-            context_note += (
-                f"\n\nPREVIOUS RESULTS FROM THIS CONVERSATION:\n"
-                + "\n".join([f"- {result}" for result in all_tool_results[-5:]])
-            )
-            context_note += f"\n\nIMPORTANT: Before using any tools, check if the information you need is already available in the previous results above. Only use tools if you need NEW information that isn't already available."
-
-        # Prevent repetitive actions within current reasoning session
-        if len(set(recent_actions)) == 1 and len(recent_actions) >= 2:
-            action_name = recent_actions[0]
-            context_note += f"\n\nWARNING: You just used {action_name} multiple times in this reasoning session. Use previous results instead."
-
-        system_prompt = (
-            ReActPrompts.format_system_prompt(self.tools, self.max_iterations)
-            + context_note
-        )
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            *[self._message_to_dict(msg) for msg in state["messages"]],
-        ]
-
-        response = self.llm.invoke(messages)
-        parsed_response = self._parse_react_response(response.content)
-
-        # Create reasoning step
-        reasoning_step = ReasoningStep(
-            thought=parsed_response.get("thought", ""),
-            action=parsed_response.get("action"),
-            action_input=parsed_response.get("action_input"),
-        )
-
-        updated_state = {
-            "messages": [response],
-            "reasoning_steps": state["reasoning_steps"] + [reasoning_step],
-            "current_thought": reasoning_step.thought,
-            "iteration_count": state["iteration_count"] + 1,
-        }
-
-        # Handle Final Answer
-        if reasoning_step.action == "Final Answer":
-            final_answer = (
-                reasoning_step.action_input.get("answer", response.content)
-                if reasoning_step.action_input
-                else response.content
-            )
-            updated_state["final_answer"] = final_answer
-
-        return updated_state
-
-    def _can_answer_from_history(self, query: str, all_tool_results: List[str]) -> bool:
-        """Simple pattern-based check for obvious continuation queries."""
-        if not all_tool_results:
-            return False
-
-        query_lower = query.lower()
-
-        # Only catch the most obvious continuation patterns
-        obvious_continuations = [
-            "continue our conversation",
-            "what was the result",
-            "what did we just",
-            "remind me of",
-        ]
-
-        return any(pattern in query_lower for pattern in obvious_continuations)
-
-    def _synthesize_answer_from_history(
-        self, query: str, all_tool_results: List[str]
-    ) -> str:
-        """Generic answer synthesis from conversation history."""
-
-        # Simple but flexible approach
-        if not all_tool_results:
-            return "No previous information available."
-
-        # For continuation queries, return the most recent relevant result
-        query_lower = query.lower()
-        if any(
-            phrase in query_lower
-            for phrase in ["continue", "what was", "remind me", "result"]
-        ):
-            return f"Based on our previous conversation: {all_tool_results[-1]}"
-
-        # Otherwise, let the ReAct agent handle it normally
-        return (
-            f"I have previous information available: {' '.join(all_tool_results[-2:])}"
-        )
-
-    def _reflection_node(self, state: AgentState) -> Dict:
-        """Synthesizes the reasoning journey into a coherent final response."""
-        final_response = state.get("final_answer", "Task completed.")
-
-        # SAFETY CHECK: Ensure we always have a meaningful response
-        if not final_response or final_response.strip() == "":
-            logger.warning("⚠️ Empty final_answer detected, creating fallback response")
-
-            # Try to extract answer from the last AI message
-            last_ai_message = None
-            for msg in reversed(state.get("messages", [])):
-                if isinstance(msg, AIMessage):
-                    last_ai_message = msg.content
-                    break
-
-            if last_ai_message:
-                final_response = last_ai_message
-            else:
-                final_response = "I processed your request but encountered an issue generating the final response. Please try rephrasing your question."
-
-        reasoning_summary = self._synthesize_reasoning_journey(state["reasoning_steps"])
-
-        reflection_message = AIMessage(
-            content=f"Final Answer: {final_response}\n\nReasoning Summary:\n{reasoning_summary}"
-        )
-
-        logger.info(
-            f"✅ Reflection node sending final response: {final_response[:100]}..."
-        )
-        return {"messages": [reflection_message]}
-
-    def _routing_decision(self, state: AgentState) -> str:
-        """Determines the next node in the reasoning workflow."""
-        if state.get("final_answer"):
-            return "finish"
-
-        if state["iteration_count"] >= state["max_iterations"]:
-            return "error"
-
-        last_reasoning_step = (
-            state["reasoning_steps"][-1] if state["reasoning_steps"] else None
-        )
-
-        if (
-            last_reasoning_step
-            and hasattr(last_reasoning_step, "action")
-            and last_reasoning_step.action
-            and last_reasoning_step.action != "Final Answer"
-        ):
-            return "continue"
-        elif (
-            last_reasoning_step
-            and isinstance(last_reasoning_step, dict)
-            and last_reasoning_step.get("action")
-            and last_reasoning_step.get("action") != "Final Answer"
-        ):
-            return "continue"
-
-        return "finish"
-
-    def _parse_react_response(self, response_content: str) -> Dict:
-        """Elegantly parses ReAct formatted responses."""
-        patterns = {
-            "thought": r"Thought:\s*(.*?)(?=\n(?:Action|$))",
-            "action": r"Action:\s*(.*?)(?=\n(?:Action Input|$))",
-            "action_input": r"Action Input:\s*(.*?)(?=\n(?:Thought|Action|$)|$)",
-        }
-
-        parsed = {}
-
-        for key, pattern in patterns.items():
-            match = re.search(pattern, response_content, re.DOTALL | re.IGNORECASE)
-            if match:
-                content = match.group(1).strip()
-                if key == "action_input":
-                    try:
-                        parsed[key] = json.loads(content)
-                    except json.JSONDecodeError:
-                        parsed[key] = {"input": content}
-                else:
-                    parsed[key] = content
-
-        return parsed
-
-    def _synthesize_reasoning_journey(
-        self, reasoning_steps: List[ReasoningStep]
-    ) -> str:
-        """Creates an elegant summary of the reasoning process."""
-        if not reasoning_steps:
-            return "No reasoning steps recorded."
-
-        summary_lines = []
-        for i, step in enumerate(reasoning_steps, 1):
-            if hasattr(step, "thought"):
-                summary_lines.append(f"Step {i}: {step.thought}")
-                if hasattr(step, "action") and step.action:
-                    summary_lines.append(f"  → Action: {step.action}")
-                if hasattr(step, "observation") and step.observation:
-                    summary_lines.append(f"  → Observation: {step.observation}")
-            elif isinstance(step, dict):
-                summary_lines.append(
-                    f"Step {i}: {step.get('thought', 'No thought recorded')}"
-                )
-                if step.get("action"):
-                    summary_lines.append(f"  → Action: {step['action']}")
-                if step.get("observation"):
-                    summary_lines.append(f"  → Observation: {step['observation']}")
-
-        return "\n".join(summary_lines)
-
-    def _message_to_dict(self, message) -> Dict:
-        """Converts LangChain messages to dictionary format."""
-        if isinstance(message, HumanMessage):
-            return {"role": "user", "content": message.content}
-        elif isinstance(message, AIMessage):
-            return {"role": "assistant", "content": message.content}
-        elif isinstance(message, ToolMessage):
-            return {"role": "tool", "content": message.content}
-        else:
-            return {"role": "system", "content": str(message.content)}
-
-    def invoke(
-        self,
-        query: str,
-        config: Optional[Dict] = None,
-        session_id: Optional[str] = None,
-        namespace: Optional[str] = None,
-    ) -> Dict:
-        """Synchronously process queries with MongoDB session management."""
-        if config is None:
-            config = self.create_session_config(session_id, namespace)
-
-        logger.info(f"Processing query with config: {config}")
-
-        try:
-            # Debug the get_tuple call
-            logger.info(f"Checking for cached state with config: {config}")
-            cached_state = self.checkpointer.get_tuple(config)
-            logger.info(f"Cached state result: {cached_state is not None}")
-
-            if cached_state:
-                logger.info(
-                    f"✅ RESUMING from cached state for session: {config['configurable']['thread_id']}"
-                )
-                logger.info(
-                    f"Cached checkpoint ID: {cached_state.checkpoint.get('id', 'unknown')}"
-                )
-                existing_messages = cached_state.checkpoint.get(
-                    "channel_values", {}
-                ).get("messages", [])
-                logger.info(f"Found {len(existing_messages)} existing messages")
-
-                # CRITICAL FIX: Reset reasoning_steps for each new query
-                # Only preserve conversation history (messages), not the reasoning steps
-                initial_state = {
-                    "messages": existing_messages + [HumanMessage(content=query)],
-                    "reasoning_steps": [],  # Reset reasoning steps for new query
-                    "current_thought": "",  # Reset current thought
-                    "iteration_count": 0,  # Reset iteration count
-                    "max_iterations": self.max_iterations,
-                    "final_answer": None,  # Reset final answer
-                }
-            else:
-                logger.info(
-                    f"🆕 STARTING fresh session: {config['configurable']['thread_id']}"
-                )
-
-                # Check what's actually in the database
-                try:
-                    db = self.checkpointer.db
-                    checkpoints_collection = db[self.checkpoint_collection_name]
-
-                    # Try different filter combinations to see what exists
-                    thread_filter = {"thread_id": config["configurable"]["thread_id"]}
-
-                    thread_count = checkpoints_collection.count_documents(thread_filter)
-                    total_count = checkpoints_collection.count_documents({})
-
-                    logger.info(
-                        f"📊 DB Debug - Total docs: {total_count}, Thread docs: {thread_count}"
-                    )
-
-                    # Show sample documents to understand the structure
-                    sample_docs = list(
-                        checkpoints_collection.find(thread_filter).limit(2)
-                    )
-                    for doc in sample_docs:
-                        logger.info(
-                            f"📄 Sample doc: thread_id={doc.get('thread_id')}, checkpoint_ns={doc.get('checkpoint_ns')}"
-                        )
-
-                except Exception as db_error:
-                    logger.error(f"DB debug error: {db_error}")
-
-                initial_state = {
-                    "messages": [HumanMessage(content=query)],
-                    "reasoning_steps": [],
-                    "current_thought": "",
-                    "iteration_count": 0,
-                    "max_iterations": self.max_iterations,
-                    "final_answer": None,
-                }
-        except Exception as e:
-            logger.error(f"Error getting cached state: {e}")
-            import traceback
-
-            traceback.print_exc()
-            initial_state = {
-                "messages": [HumanMessage(content=query)],
-                "reasoning_steps": [],
-                "current_thought": "",
-                "iteration_count": 0,
-                "max_iterations": self.max_iterations,
-                "final_answer": None,
-            }
-
-        try:
-            result = self.workflow.invoke(initial_state, config=config)
-
-            # CRITICAL SAFETY CHECK: Ensure user always gets a response
-            final_messages = result.get("messages", [])
-            if not final_messages:
-                logger.error("❌ No messages in result - adding emergency response")
-                result["messages"] = [
-                    AIMessage(
-                        content="I processed your request but didn't generate a proper response. Please try again."
-                    )
-                ]
-
-            # Check if the last message is meaningful
-            last_message = final_messages[-1] if final_messages else None
-            if not last_message or not last_message.content.strip():
-                logger.error("❌ Empty final message - adding emergency response")
-                if not final_messages:
-                    result["messages"] = []
-                result["messages"].append(
-                    AIMessage(
-                        content="I encountered an issue generating a response. Based on our conversation, please let me know if you need clarification on anything."
-                    )
-                )
-
-            session_info = {
-                "session_id": config["configurable"].get("thread_id"),
-                "namespace": config["configurable"].get("checkpoint_ns", "default"),
-                "timestamp": datetime.now().isoformat(),
-            }
-
-            result["session_info"] = session_info
-            return result
-
-        except Exception as e:
-            logger.error(f"❌ CRITICAL ERROR in workflow execution: {e}")
-            import traceback
-
-            traceback.print_exc()
-
-            # EMERGENCY RESPONSE: Always provide something to the user
-            emergency_result = {
-                "messages": [
-                    AIMessage(
-                        content=f"I encountered an error while processing your request: {str(e)}. Please try rephrasing your question or contact support if the issue persists."
-                    )
-                ],
-                "session_info": {
-                    "session_id": config["configurable"].get("thread_id"),
-                    "namespace": config["configurable"].get("checkpoint_ns", "default"),
-                    "timestamp": datetime.now().isoformat(),
-                    "error": True,
-                },
-            }
-            return emergency_result
-
-
-def demonstrate_react_agent():
-    """Demonstrates ReAct agent with proper MongoDB context management."""
     with ReActAgent(
         llm=ChatOpenAI(
             base_url="https://models.github.ai/inference",
             api_key=os.getenv("OPENAI_KEY"),
-            model="openai/gpt-4.1",
+            model="openai/gpt-4.1-mini",
             temperature=0.8,
         ),
         max_iterations=8,
         mongodb_uri="mongodb://localhost:27017",
-        db_name="react_agents_prod",
+        db_name="react_agents_prod_interrupts_fixed",
+        enable_human_interrupts=True,
         use_persistence=True,
     ) as agent:
 
-        print("✅ Initialized ReAct Agent with MongoDB persistence")
+        session_id = "interrupt_demo_001"
 
-        scenarios = [
-            {
-                "query": "What is Python and calculate 15 * 23?",
-                "session_id": "prod_session_001",
-                "namespace": None,  # Don't use namespace to match existing data
-            },
-            {
-                "query": "Continue our conversation - what was the result?",
-                "session_id": "prod_session_001",
-                "namespace": None,  # Don't use namespace to match existing data
-            },
-        ]
+        # Query that triggers interrupt
+        print("🚀 Starting query that requires approval...")
+        result = agent.invoke(
+            query="Calculate 42 * 17 and then search for Python information",
+            session_id=session_id,
+        )
 
-        for i, scenario in enumerate(scenarios, 1):
-            print(f"\n🔍 Test {i}: {scenario['query']}")
+        if result.get("interrupted"):
+            print(f"\n⚠️ INTERRUPT DETECTED!")
+            print(f"\nMessage:\n{result['interrupt_message']}")
+            print(f"\nPending Tool: {result['pending_tool']['tool_name']}")
+            print(f"Tool Input: {result['pending_tool']['tool_input']}")
 
-            try:
-                result = agent.invoke(
-                    query=scenario["query"],
-                    session_id=scenario["session_id"],
-                    namespace=scenario["namespace"],
+            # Simulate user decision
+            user_decision = input("\n✅ Approve this operation? (y/n): ")
+
+            if user_decision.lower() == "y":
+                print("\n🔄 Resuming with approval...")
+                final_result = agent.resume_with_approval(
+                    session_id=session_id, approved=True
+                )
+            else:
+                print("\n🔄 Resuming with rejection...")
+                final_result = agent.resume_with_approval(
+                    session_id=session_id,
+                    approved=False,
+                    rejection_reason="User prefers not to execute the calculation.",
                 )
 
-                final_messages = result.get("messages", [])
-                if final_messages:
-                    print(f"📋 Response: {final_messages[-1].content}")
+            # Display final result
+            if final_result.get("messages"):
+                print("\n📋 Final Response:")
+                for msg in final_result["messages"][-3:]:  # Show last few messages
+                    if isinstance(msg, BaseMessage):
+                        print(f"- {msg.content}")
+                    elif isinstance(msg, dict):
+                        print(f"- {msg.get('content', str(msg))}")
+        else:
+            # No interrupt occurred
+            print("\n📋 Direct Response (no interrupt required):")
+            if result.get("messages"):
+                for msg in result["messages"][-2:]:
+                    if hasattr(msg, "content"):
+                        print(f"- {msg.content}")
 
-                # Show session stats
-                stats = agent.get_session_stats(namespace=scenario["namespace"])
-                print(f"📊 Session Stats: {stats}")
+        # Demonstrate session persistence
+        print("\n\n🔄 Simulating user returning to check session status...")
+        interrupt_status = agent.get_interrupt_status(session_id)
 
-            except Exception as e:
-                print(f"❌ Error: {str(e)}")
+        if interrupt_status["has_interrupt"]:
+            print(f"⚠️ Found pending interrupt!")
+            print(f"Message: {interrupt_status['interrupt_message']}")
+        else:
+            print("✅ No pending interrupts found")
+
+        # Test a new session with safe tool
+        print("\n\n🆕 Testing with a safe tool (no interrupt expected)...")
+        safe_result = agent.invoke(
+            query="What's the current timestamp?", session_id="safe_demo_001"
+        )
+
+        if safe_result.get("interrupted"):
+            print("❌ Unexpected interrupt!")
+        else:
+            print("✅ Query executed without interrupt")
+            if safe_result.get("messages"):
+                last_msg = safe_result["messages"][-1]
+                print(
+                    f"Response: {last_msg.content if hasattr(last_msg, 'content') else last_msg}"
+                )
+
+
+def demonstrate_session_persistence():
+    """Demonstrate how sessions persist across disconnections."""
+
+    print("📚 Demonstrating Session Persistence\n")
+
+    # Phase 1: Start a session that will be interrupted
+    print("Phase 1: Initial query with interrupt")
+    print("-" * 50)
+
+    with ReActAgent(
+        llm=ChatOpenAI(
+            base_url="https://models.github.ai/inference",
+            api_key=os.getenv("OPENAI_KEY"),
+            model="openai/gpt-4.1-mini",
+            temperature=0.8,
+        ),
+        mongodb_uri="mongodb://localhost:27017",
+        db_name="react_agents_prod_interrupts_fixed",
+        enable_human_interrupts=True,
+        use_persistence=True,
+    ) as agent:
+
+        session_id = "persistence_demo_001"
+
+        result = agent.invoke(
+            query="Calculate the square root of 144 and then tell me about machine learning",
+            session_id=session_id,
+        )
+
+        if result.get("interrupted"):
+            print("✅ Interrupt triggered as expected")
+            print(f"Interrupt message: {result['interrupt_message'][:100]}...")
+            print("\n💾 Session saved to MongoDB with pending interrupt")
+        else:
+            print("❌ Expected interrupt but none occurred")
+
+    # Phase 2: Simulate user returning later
+    print("\n\nPhase 2: User returns later (new agent instance)")
+    print("-" * 50)
+    print("Simulating time passing... user opens a new browser tab...\n")
+
+    with ReActAgent(
+        llm=ChatOpenAI(
+            base_url="https://models.github.ai/inference",
+            api_key=os.getenv("OPENAI_KEY"),
+            model="openai/gpt-4.1-mini",
+            temperature=0.8,
+        ),
+        mongodb_uri="mongodb://localhost:27017",
+        db_name="react_agents_prod_interrupts_fixed",
+        enable_human_interrupts=True,
+        use_persistence=True,
+    ) as new_agent:
+
+        # Check if the session has a pending interrupt
+        status = new_agent.get_interrupt_status(session_id)
+
+        if status["has_interrupt"]:
+            print("🔔 Found pending interrupt from previous session!")
+            print(f"\nPending operation: {status['pending_tool']['tool_name']}")
+            print(f"Tool input: {status['pending_tool']['tool_input']}")
+
+            # User makes a decision
+            user_choice = input("\nApprove the pending operation? (y/n): ")
+
+            if user_choice.lower() == "y":
+                print("\n✅ Approving and continuing...")
+                result = new_agent.resume_with_approval(
+                    session_id=session_id, approved=True
+                )
+            else:
+                print("\n❌ Rejecting operation...")
+                result = new_agent.resume_with_approval(
+                    session_id=session_id,
+                    approved=False,
+                    rejection_reason="User decided against the calculation after returning.",
+                )
+
+            # Show the final result
+            if result.get("messages"):
+                print("\n📋 Final Result:")
+                for msg in result["messages"][-3:]:
+                    if hasattr(msg, "content"):
+                        print(f"- {msg.content[:]}...")
+        else:
+            print("❌ No pending interrupt found (unexpected)")
+
+
+def demonstrate_multi_tool_workflow():
+    """Demonstrate workflow with multiple tools, some safe and some requiring approval."""
+
+    print("🔧 Demonstrating Multi-Tool Workflow\n")
+
+    with ReActAgent(
+        llm=ChatOpenAI(
+            base_url="https://models.github.ai/inference",
+            api_key=os.getenv("OPENAI_KEY"),
+            model="openai/gpt-4.1-mini",
+            temperature=0.8,
+        ),
+        mongodb_uri="mongodb://localhost:27017",
+        db_name="react_agents_prod_interrupts_fixed",
+        enable_human_interrupts=True,
+        use_persistence=True,
+    ) as agent:
+
+        session_id = "multi_tool_demo_001"
+
+        # Complex query requiring multiple tools
+        query = (
+            "First get the current timestamp, "
+            "then calculate 15 * 23 + 42, "
+            "and finally search for information about Python. "
+            "Present all results in your response."
+        )
+
+        print(f"📝 Query: {query}\n")
+
+        result = agent.invoke(query=query, session_id=session_id)
+
+        # Handle potential interrupts during multi-tool execution
+        while result.get("interrupted"):
+            print(f"\n⚠️ Approval Required!")
+            print(f"Tool: {result['pending_tool']['tool_name']}")
+            print(f"Input: {result['pending_tool']['tool_input']}")
+
+            approval = input("\nApprove? (y/n): ")
+
+            if approval.lower() == "y":
+                print("✅ Approved, continuing...")
+                result = agent.resume_with_approval(
+                    session_id=session_id, approved=True
+                )
+            else:
+                print("❌ Rejected, finding alternative...")
+                result = agent.resume_with_approval(
+                    session_id=session_id,
+                    approved=False,
+                    rejection_reason="User rejected this specific tool execution.",
+                )
+
+        # Display final results
+        print("\n📊 Workflow Complete!")
+        if result.get("final_answer"):
+            print(f"\nFinal Answer:\n{result['final_answer']}")
+        elif result.get("messages"):
+            print("\nFinal Messages:")
+            for msg in result["messages"][-3:]:
+                if hasattr(msg, "content"):
+                    print(f"- {msg.content[:300]}...")
+
+
+def demonstrate_custom_tool_safety():
+    """Demonstrate custom tool safety configuration."""
+
+    print("🛡️ Demonstrating Custom Tool Safety Configuration\n")
+
+    # Create a custom dangerous tool
+    @tool
+    def execute_system_command(command: str) -> str:
+        """Execute a system command (DANGEROUS - for demo only)."""
+        return f"Would execute: {command} (blocked for safety)"
+
+    with ReActAgent(
+        llm=ChatOpenAI(
+            base_url="https://models.github.ai/inference",
+            api_key=os.getenv("OPENAI_KEY"),
+            model="openai/gpt-4.1-mini",
+            temperature=0.8,
+        ),
+        tools=[
+            search_knowledge_base,
+            calculate_mathematical_expression,
+            get_current_timestamp,
+            execute_system_command,
+        ],
+        mongodb_uri="mongodb://localhost:27017",
+        db_name="react_agents_prod_interrupts_fixed",
+        enable_human_interrupts=True,
+        use_persistence=True,
+    ) as agent:
+
+        # Register the dangerous tool
+        agent.tool_safety_registry.register_profile(
+            ToolSafetyProfile(
+                tool_name="execute_system_command",
+                requires_approval=True,
+                risk_level="critical",
+                approval_prompt="This will execute a system command on the host machine.",
+                risk_rationale="Direct system command execution - maximum security risk",
+            )
+        )
+
+        session_id = "custom_safety_demo_001"
+
+        result = agent.invoke(
+            query="Execute the 'ls -la' command to list files", session_id=session_id
+        )
+
+        if result.get("interrupted"):
+            print("⚠️ Critical operation detected!")
+            print(f"\nRisk Level: CRITICAL")
+            print(f"Operation: {result['pending_tool']['tool_name']}")
+            print(f"Command: {result['pending_tool']['tool_input']}")
+
+            # Always reject dangerous operations in demo
+            print("\n❌ Auto-rejecting dangerous operation for safety")
+            final_result = agent.resume_with_approval(
+                session_id=session_id,
+                approved=False,
+                rejection_reason="System command execution is not permitted.",
+            )
+
+            if final_result.get("messages"):
+                print(f"\nAgent response: {final_result['messages'][-1].content}")
 
 
 if __name__ == "__main__":
-    demonstrate_react_agent()
+    print("🚀 ReAct Agent with Human-in-the-Loop Interrupts\n")
+    print("Choose a demonstration:")
+    print("1. Basic interrupt workflow")
+    print("2. Session persistence across disconnections")
+    print("3. Multi-tool workflow with selective approvals")
+    print("4. Custom tool safety configuration")
+
+    choice = input("\nEnter your choice (1-4): ")
+
+    demonstrations = {
+        "1": demonstrate_interrupt_workflow,
+        "2": demonstrate_session_persistence,
+        "3": demonstrate_multi_tool_workflow,
+        "4": demonstrate_custom_tool_safety,
+    }
+
+    if choice in demonstrations:
+        demonstrations[choice]()
+    else:
+        print("Invalid choice. Running basic demonstration...")
+        demonstrate_interrupt_workflow()
