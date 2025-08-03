@@ -1,8 +1,10 @@
 import asyncio
+import re
 import subprocess
 from typing import TypedDict, Annotated, Literal
 from dataclasses import dataclass
 from dotenv import load_dotenv
+import httpx
 from langgraph.graph import StateGraph, START, END, add_messages
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.mongodb import MongoDBSaver
@@ -13,6 +15,11 @@ from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from langgraph.checkpoint.mongodb.aio import AsyncMongoDBSaver
 import os
 from motor.motor_asyncio import AsyncIOMotorClient
+
+# tools
+from langchain_community.tools import DuckDuckGoSearchRun
+from pydantic import BaseModel
+from pydantic_core import Url
 
 load_dotenv(".env.agents", override=True)
 
@@ -58,7 +65,59 @@ def system_command(command: str) -> str:
     """Execute system command - DANGEROUS TOOL"""
     return subprocess.getoutput(command)
 
-TOOLS = [file_reader, web_search, system_command, get_files_with_extension, simple_math]
+@tool
+def fetch_ticker_info(ticker: str) -> str:
+    """Fetch stock ticker information"""
+    try:
+        import yfinance as yf
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        return f"Information for ticker {ticker}: {info}"
+    except Exception as e:
+        return f"Error fetching ticker info: {e}"
+
+class WeatherData(BaseModel):
+    source_url: Url
+    location: str
+    condition: str
+    temperature: str
+
+@tool(response_format="content")
+async def weather_scraper(location: str) -> WeatherData:
+    """Get current weather by scraping wttr.in"""
+    try:
+        url = f"http://wttr.in/{location}?format=%l:+%C+%t"
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, timeout=5)
+
+        text = response.text.strip()
+        match = re.match(r"(.+?):\s+(.+?)\s+([\+\-]?\d+°\w+)", text)
+
+        if match:
+            return WeatherData(
+                source_url=url,
+                location=match.group(1),
+                condition=match.group(2),
+                temperature=match.group(3)
+            )
+
+        return WeatherData(source_url=url, location=location, condition="unknown", temperature="unknown")
+    except:
+        return WeatherData(source_url=url, location=location, condition="unavailable", temperature="unknown")
+
+@tool
+async def three_day_forecast(location: str) -> str:
+    """Get 3-day weather forecast for a location"""
+    try:
+        url = f"http://wttr.in/{location}?T"
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, follow_redirects=False, timeout=5)
+        return response.text.strip()
+    except:
+        return f"Forecast data unavailable for {location}"
+
+
+TOOLS = [file_reader, web_search, system_command, get_files_with_extension, simple_math, fetch_ticker_info, weather_scraper, three_day_forecast, ]
 DANGEROUS_TOOLS = {"system_command", "simple_math"}
 
 def create_llm():
@@ -170,7 +229,7 @@ async def run_agent():
 
     agent = await create_agent(checkpointer=saver)
     config = {"configurable": {"thread_id": "test-thread"}}
-    format_instruction = "Format as email with subject and body."
+    format_instruction = None # "Format as email with subject and body."
 
     try:
         state: StateGraph = await agent.aget_state(config)
